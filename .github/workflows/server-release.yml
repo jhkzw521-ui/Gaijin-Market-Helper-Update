@@ -1,0 +1,84 @@
+name: Build signed-server archive
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - ci/server-2.0.0.24
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Extract build input
+        run: |
+          set -euo pipefail
+          mkdir -p input
+          cat source-part-* > source.tar.gz
+          tar -xzf source.tar.gz -C input
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 8.0.x
+
+      - name: Publish and package server
+        env:
+          BUILD_ID: 20260904-inventory-workbench-r2
+          VERSION: 2.0.0.24
+        run: |
+          set -euo pipefail
+          ROOT="$PWD/input"
+          NAME="GaijinTradeWebServer-${VERSION}-${BUILD_ID}-linux-x64"
+          STAGE="$PWD/$NAME"
+          PAYLOAD="$STAGE/payload"
+          mkdir -p "$PAYLOAD/web-query" "$PAYLOAD/licensing" "$PAYLOAD/sites/app" "$PAYLOAD/sites/promo" "$PAYLOAD/systemd" "$PAYLOAD/data"
+          dotnet publish "$ROOT/work/web-query-server/GaijinTrade.Web.csproj" -c Release -r linux-x64 --self-contained true -p:DebugType=None -p:DebugSymbols=false -p:PublishTrimmed=false -o "$PAYLOAD/web-query" --nologo
+          dotnet publish "$ROOT/work/licensing-server/GaijinTrade.Licensing.Server.csproj" -c Release -r linux-x64 --self-contained true -p:DebugType=None -p:DebugSymbols=false -p:PublishTrimmed=false -o "$PAYLOAD/licensing" --nologo
+          find "$PAYLOAD/web-query" "$PAYLOAD/licensing" -type f \( -name '*.pdb' -o -name '*.xml' \) -delete
+          rm -f "$PAYLOAD/web-query/data/paid-algorithms.example.json" "$PAYLOAD/licensing/data/paid-algorithms.example.json"
+          cp "$ROOT/work/server-deploy/upgrade-web-query.sh" "$STAGE/"
+          cp "$ROOT/work/server-deploy/enable-admin-api.sh" "$STAGE/"
+          cp -R "$ROOT/work/server-deploy/web-systemd/." "$PAYLOAD/systemd/"
+          cp "$ROOT/work/server-deploy/systemd/gaijin-trade-licensing.service" "$PAYLOAD/systemd/"
+          cp -R "$ROOT/work/server-deploy/site/." "$PAYLOAD/sites/promo/"
+          sed -i 's/__PROMO_BUILD_ID__/'"$BUILD_ID"'/g' "$PAYLOAD/sites/promo/index.html"
+          cp -R "$ROOT/work/web-query-site/." "$PAYLOAD/sites/app/"
+          cp "$ROOT/work/data/catalog/gaijin-market-catalog.v1.json" "$PAYLOAD/data/"
+          cp "$ROOT/work/data/official-events/official-return-events.v1.json" "$PAYLOAD/data/"
+          cp "$ROOT/work/data/official-events/gaijin_market_return_tags.json" "$PAYLOAD/data/gaijin-market-return-tags.v1.json"
+          RETURN_HASH=$(sha256sum "$PAYLOAD/data/gaijin-market-return-tags.v1.json" | awk '{print $1}')
+          test "$RETURN_HASH" = "0556e50c14058933492658e13c2aaf88ec6b0bbc5b859e9a98063b17777bfb23"
+          cat > "$PAYLOAD/server-release.json" <<EOF
+          {"schema":"gaijin-trade-helper-server-update-v1","version":"${VERSION}","productVersion":"2.0.0","buildId":"${BUILD_ID}","architecture":"linux-x64","queryOnly":false,"automaticTrading":true}
+          EOF
+          INSTALL_ID=$(python3 -c 'import uuid; print(uuid.uuid4())')
+          printf '%s\n' '{"schema":"gaijin-trade-helper/install-root/v1","product":"GaijinTradeHelper","installationId":"'"$INSTALL_ID"'","purpose":"server-update-release"}' > "$PAYLOAD/.gaijin-trade-helper-install.json"
+          tar --format=gnu -czf "$NAME.tar.gz" "$NAME"
+          sha256sum "$NAME.tar.gz" > "$NAME.tar.gz.sha256"
+          echo "ARCHIVE=$NAME.tar.gz" >> "$GITHUB_ENV"
+
+      - name: Upload workflow artifact
+        if: false
+        uses: actions/upload-artifact@v4
+        with:
+          name: server-archive
+          path: |
+            GaijinTradeWebServer-*.tar.gz
+            GaijinTradeWebServer-*.tar.gz.sha256
+          if-no-files-found: error
+          retention-days: 1
+
+      - name: Create draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: 2.0.0.24
+        run: |
+          set -euo pipefail
+          gh release delete "v${VERSION}" --yes --cleanup-tag || true
+          gh release create "v${VERSION}" "$ARCHIVE" "$ARCHIVE.sha256" \
+            --draft \
+            --title "Gaijin Trade Server v${VERSION}" \
+            --notes "Automated server build for inventory workbench r2."
